@@ -32,3 +32,8 @@ target_link_libraries(global_planning
   ${OMPL_LIBRARIES}
   ${catkin_LIBRARIES}
 )
+
+catkin_install_python(PROGRAMS
+  scripts/replay_gcopter_traj_node.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)

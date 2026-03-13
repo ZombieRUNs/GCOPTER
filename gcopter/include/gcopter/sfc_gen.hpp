@@ -166,7 +166,9 @@ namespace sfc_gen
                     valid_pc.emplace_back(p);
                 }
             }
-            Eigen::Map<const Eigen::Matrix<double, 3, -1, Eigen::ColMajor>> pc(valid_pc[0].data(), 3, valid_pc.size());
+            Eigen::Matrix3Xd pc(3, valid_pc.size());
+            for (size_t _i = 0; _i < valid_pc.size(); ++_i)
+                pc.col(_i) = valid_pc[_i];
 
             firi::firi(bd, pc, a, b, hp);
 

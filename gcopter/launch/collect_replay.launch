@@ -1,0 +1,37 @@
+<launch>
+  <arg name="dataset_root" default="$(env HOME)/workspace/YOPO/run/dataset/gcopter_trajs"/>
+  <arg name="scene_id" default="0"/>
+  <arg name="traj_id" default="0"/>
+  <arg name="rate" default="30"/>
+  <arg name="frame_id" default="world"/>
+  <arg name="check_collision" default="true"/>
+  <arg name="collision_radius" default="0.5"/>
+  <arg name="video_out" default=""/>
+  <arg name="loop" default="false"/>
+  <arg name="video_only" default="false"/>
+  <arg name="use_rviz" default="true"/>
+  <arg name="rviz_config" default="$(find gcopter)/config/collect_replay.rviz"/>
+
+  <node if="$(arg use_rviz)"
+        pkg="rviz"
+        type="rviz"
+        name="rviz"
+        output="screen"
+        args="-d $(arg rviz_config)"/>
+
+  <node pkg="gcopter"
+        type="replay_gcopter_traj_node.py"
+        name="collect_replay"
+        output="screen"
+        args="--dataset_root $(arg dataset_root)
+              --scene_id $(arg scene_id)
+              --traj_id $(arg traj_id)
+              --rate $(arg rate)
+              --frame_id $(arg frame_id)
+              --check_collision=$(arg check_collision)
+              --collision_radius $(arg collision_radius)
+              --video_out $(arg video_out)
+              --loop=$(arg loop)
+              --video_only=$(arg video_only)"/>
+</launch>
+
