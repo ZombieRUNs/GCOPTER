@@ -920,6 +920,21 @@ namespace gcopter
         FLAP_PHYSICAL_DIM = 5
     };
 
+    // flappingAllocation: FLAP_ALLOC_DIM = 3 entries. The left/right wing
+    // thrust allocation the total-thrust / total-roll coupling comes from:
+    //   T = T_L + T_R,  Gamma_x = l_eff (T_R - T_L),
+    // which every node must satisfy with F_min <= T_L, T_R <= F_max. This is a
+    // genuinely new constraint set, not a restatement of the total-thrust or
+    // |Gamma_i| bounds: a node can meet both of those and still leave one side
+    // outside [F_min, F_max].
+    enum FlappingAllocationIndex
+    {
+        FLAP_ALLOC_ROLL_ARM = 0,   // l_eff [m], > 0 (single-side effective arm)
+        FLAP_ALLOC_WING_MIN = 1,   // F_min [N], >= 0 (per-side lower bound)
+        FLAP_ALLOC_WING_MAX = 2,   // F_max [N], > F_min (per-side upper bound)
+        FLAP_ALLOC_DIM = 3
+    };
+
     // Which constraint produced the worst violation, for reporting.
     enum class FlappingViolation
     {
@@ -931,7 +946,14 @@ namespace gcopter
         Omega = 5,
         Gamma = 6,
         Tilt = 7,
-        Degenerate = 8
+        Degenerate = 8,
+        // The four left/right wing-thrust bounds. T_L is the lower-thrust side
+        // when Gamma_x > 0, T_R the higher one; the names follow the wing, not
+        // the sign of Gamma_x.
+        WingLeftLow = 9,
+        WingLeftHigh = 10,
+        WingRightLow = 11,
+        WingRightHigh = 12
     };
 
     inline const char *flappingViolationName(const FlappingViolation v)
@@ -956,6 +978,14 @@ namespace gcopter
             return "Tilt";
         case FlappingViolation::Degenerate:
             return "Degenerate";
+        case FlappingViolation::WingLeftLow:
+            return "WingLeftLow";
+        case FlappingViolation::WingLeftHigh:
+            return "WingLeftHigh";
+        case FlappingViolation::WingRightLow:
+            return "WingRightLow";
+        case FlappingViolation::WingRightHigh:
+            return "WingRightHigh";
         }
         return "Unknown";
     }
@@ -984,12 +1014,30 @@ namespace gcopter
         double gravity = 0.0;
         Eigen::Vector3d inertia = Eigen::Vector3d::Zero();
 
+        // Left/right wing thrust allocation. l_eff is the single-side roll arm
+        // [m]; wingMin/wingMax are the per-side thrust bounds [N]. weightWing is
+        // the scalar weight of the four per-side penalties.
+        double rollArm = 0.0;
+        double wingThrustMin = 0.0;
+        double wingThrustMax = 0.0;
+        double weightWingThrust = 0.0;
+
         // Length and value validation. Returns false and fills `reason` with a
         // message naming the offending entry; nothing is written to `cfg` in
         // that case.
+        //
+        // The allocation vector and the wing-weight scalar are explicit
+        // arguments rather than fields of `bounds`/`weights`: the existing
+        // 11/7/5 entry layouts above are unchanged, and the four per-side
+        // bounds are a separate constraint set. There is deliberately no
+        // compiled-in production default for them -- a caller has to supply
+        // them, so a test or a stale config cannot silently inherit the shipped
+        // vehicle's numbers.
         static inline bool parse(const Eigen::VectorXd &bounds,
                                  const Eigen::VectorXd &weights,
                                  const Eigen::VectorXd &physical,
+                                 const Eigen::VectorXd &allocation,
+                                 const double weightWingThrust,
                                  FlappingConfig &cfg,
                                  std::string &reason)
         {
@@ -1016,6 +1064,12 @@ namespace gcopter
                             std::to_string(FLAP_PHYSICAL_DIM) + " entries, got " +
                             std::to_string(physical.size()));
             }
+            if (allocation.size() != FLAP_ALLOC_DIM)
+            {
+                return fail("flappingAllocation must have FLAP_ALLOC_DIM = " +
+                            std::to_string(FLAP_ALLOC_DIM) + " entries, got " +
+                            std::to_string(allocation.size()));
+            }
             if (!flapping::detail::isFinite(bounds))
             {
                 return fail("flappingBounds contains NaN or Inf");
@@ -1027,6 +1081,14 @@ namespace gcopter
             if (!flapping::detail::isFinite(physical))
             {
                 return fail("flappingPhysical contains NaN or Inf");
+            }
+            if (!flapping::detail::isFinite(allocation))
+            {
+                return fail("flappingAllocation contains NaN or Inf");
+            }
+            if (!flapping::detail::isFinite(weightWingThrust))
+            {
+                return fail("weightWingThrust contains NaN or Inf");
             }
 
             FlappingConfig parsed;
@@ -1116,6 +1178,44 @@ namespace gcopter
                 }
             }
 
+            parsed.rollArm = allocation(FLAP_ALLOC_ROLL_ARM);
+            if (!(parsed.rollArm > 0.0))
+            {
+                return fail(named("flappingAllocation[ROLL_ARM]", "must be > 0"));
+            }
+            parsed.wingThrustMin = allocation(FLAP_ALLOC_WING_MIN);
+            parsed.wingThrustMax = allocation(FLAP_ALLOC_WING_MAX);
+            if (!(parsed.wingThrustMin >= 0.0))
+            {
+                return fail(named("flappingAllocation[WING_MIN]", "must be >= 0"));
+            }
+            if (!(parsed.wingThrustMax > parsed.wingThrustMin))
+            {
+                return fail(named("flappingAllocation[WING_MAX]",
+                                  "must be > WING_MIN"));
+            }
+            if (!(weightWingThrust >= 0.0))
+            {
+                return fail(named("weightWingThrust", "must be >= 0"));
+            }
+            // The total-thrust interval has to sit inside the range the two
+            // sides can actually produce. A total bound wider than
+            // [2 F_min, 2 F_max] would let the optimiser command a total thrust
+            // no admissible split can realise, which is exactly the coupling
+            // this constraint set adds.
+            if (parsed.thrustMin < 2.0 * parsed.wingThrustMin)
+            {
+                return fail(named("flappingBounds[THRUST_MIN]",
+                                  "must be >= 2 * flappingAllocation[WING_MIN]"));
+            }
+            if (parsed.thrustMax > 2.0 * parsed.wingThrustMax)
+            {
+                return fail(named("flappingBounds[THRUST_MAX]",
+                                  "must be <= 2 * flappingAllocation[WING_MAX]"));
+            }
+
+            parsed.weightWingThrust = weightWingThrust;
+
             cfg = parsed;
             reason.clear();
             return true;
@@ -1172,6 +1272,103 @@ namespace gcopter
         double penaltyTilt = 0.0;
         double penaltyDegenerate = 0.0;
 
+        // --- left/right wing thrust allocation -------------------------------
+        // One forward() call per node gives T = thrust and Gamma_x = gamma(0);
+        // these are the split T_L = 0.5 (T - Gamma_x / l_eff),
+        // T_R = 0.5 (T + Gamma_x / l_eff) that the per-side bounds apply to.
+        //
+        // Observation ranges, over the nodes where the split is defined (a
+        // node without a usable attitude has no Gamma_x and is not measured):
+        double minWingLeft = 0.0;   // [N]
+        double maxWingLeft = 0.0;   // [N]
+        double minWingRight = 0.0;  // [N]
+        double maxWingRight = 0.0;  // [N]
+        int wingNodes = 0;          // nodes the split was evaluated at
+
+        // Raw per-side bound exceedances [N], each 0 when its bound holds. The
+        // four are independent: a node can violate only one side, or both.
+        double violaWingLeftLow = 0.0;   // F_min - T_L
+        double violaWingLeftHigh = 0.0;  // T_L - F_max
+        double violaWingRightLow = 0.0;  // F_min - T_R
+        double violaWingRightHigh = 0.0; // T_R - F_max
+
+        // The worst of the four, in its own [N] unit, and which one it was.
+        // These two mirror violaGamma/worst for the single-constraint fields:
+        // the aggregate above ranks every enabled constraint by relative
+        // exceedance, this one is the allocation set's own reading.
+        double violaWing = 0.0;               // [N]
+        FlappingViolation worstWing = FlappingViolation::None;
+        double wingWorstRelative = 0.0;       // dimensionless, wingMaxViola's value
+
+        // The allocation's share of `cost`, one entry per per-side bound, with
+        // the same trapezoidal weight as the penalty_* block above. They sum to
+        // the allocation term inside `cost`.
+        double penaltyWingLeftLow = 0.0;
+        double penaltyWingLeftHigh = 0.0;
+        double penaltyWingRightLow = 0.0;
+        double penaltyWingRightHigh = 0.0;
+
+        // The configuration the report was measured against, carried so a
+        // reader can tell T_L/T_R from the raw total thrust without the config
+        // file at hand. source: this report's own config, never the plant.
+        double rollArm = 0.0;         // [m]
+        double wingThrustMin = 0.0;   // [N]
+        double wingThrustMax = 0.0;   // [N]
+        double weightWingThrust = 0.0;
+
+        // Relative exceedance of the allocation set: the largest of the four
+        // per-side exceedances over its own bound, using F_min for the lower
+        // bounds and F_max for the upper ones. When F_min is exactly 0 the
+        // lower bounds are charged against F_max instead, so a negative wing
+        // thrust (a physically impossible command) is still reported rather
+        // than divided by zero. `wingWorstRelative`, filled by the penalty, is
+        // this quantity; the method recomputes it from the stored raw
+        // exceedances and the configuration the report carries.
+        inline double wingMaxViola() const
+        {
+            const double lowScale = wingThrustMin > 0.0
+                                        ? 1.0 / wingThrustMin
+                                        : (wingThrustMax > 0.0
+                                               ? 1.0 / wingThrustMax
+                                               : 0.0);
+            const double highScale =
+                wingThrustMax > 0.0 ? 1.0 / wingThrustMax : 0.0;
+            double worst = 0.0;
+            for (const double entry : {violaWingLeftLow * lowScale,
+                                       violaWingLeftHigh * highScale,
+                                       violaWingRightLow * lowScale,
+                                       violaWingRightHigh * highScale})
+            {
+                if (entry > worst)
+                {
+                    worst = entry;
+                }
+            }
+            return worst;
+        }
+
+        // The joint allocation set is satisfied only when the split actually
+        // covered the whole trajectory and no per-side bound was exceeded:
+        //
+        //   nodeCount > 0            the report examined something
+        //   degenerateNodes == 0     no node was refused an attitude
+        //   wingNodes == nodeCount   every node's split was measured
+        //   wingMaxViola() <= tol    no per-side bound was exceeded
+        //
+        // `wingMaxViola() <= tolerance` alone is not the verdict: a node the
+        // map refused an attitude for has no Gamma_x, so it is never split,
+        // which leaves wingNodes short of nodeCount and maxViola at 0. Reading
+        // only the relative exceedance would then call a fully degenerate
+        // trajectory (degenerateNodes == nodeCount, wingNodes == 0) feasible.
+        // There is no node-count exception: a node with an attitude always
+        // yields a (T, Gamma_x) split, so wingNodes == nodeCount holds for every
+        // fully-measured trajectory.
+        inline bool allocationFeasible(const double tolerance = 0.0) const
+        {
+            return nodeCount > 0 && degenerateNodes == 0 &&
+                   wingNodes == nodeCount && wingMaxViola() <= tolerance;
+        }
+
         inline bool feasible(const double tolerance = 0.0) const
         {
             return maxViola <= tolerance;
@@ -1197,7 +1394,14 @@ namespace gcopter
                    << " omg=" << violaOmega
                    << " gam=" << violaGamma
                    << " tilt=" << violaTilt
-                   << " pos=" << violaCorridor;
+                   << " pos=" << violaCorridor
+                   << " | wing L=[" << minWingLeft << "," << maxWingLeft
+                   << "] R=[" << minWingRight << "," << maxWingRight
+                   << "] viola Llo=" << violaWingLeftLow
+                   << " Lhi=" << violaWingLeftHigh
+                   << " Rlo=" << violaWingRightLow
+                   << " Rhi=" << violaWingRightHigh
+                   << " worst=" << flappingViolationName(worstWing);
             return stream.str();
         }
     };
@@ -1537,6 +1741,28 @@ namespace gcopter
                 1.0 / cfg.omegaMax.maxCoeff();
             const double gammaScale =
                 1.0 / cfg.gammaMax.maxCoeff();
+            // The per-side allocation bounds are normalised the same way the
+            // total-thrust bounds are: F_min for the lower bounds, F_max for the
+            // upper ones. When F_min is exactly 0 the lower bounds fall back to
+            // F_max, so a negative wing thrust (a physically impossible command)
+            // is still a finite relative exceedance rather than a divide by zero.
+            const double wingLowScale =
+                cfg.wingThrustMin > 0.0
+                    ? 1.0 / cfg.wingThrustMin
+                    : (cfg.wingThrustMax > 0.0 ? 1.0 / cfg.wingThrustMax : 0.0);
+            const double wingHighScale =
+                cfg.wingThrustMax > 0.0 ? 1.0 / cfg.wingThrustMax : 0.0;
+
+            if (report != nullptr)
+            {
+                // The bounds the allocation readings are measured against,
+                // carried with the report so a reader can split T_L/T_R without
+                // the config file. This is this run's own validated config.
+                report->rollArm = cfg.rollArm;
+                report->wingThrustMin = cfg.wingThrustMin;
+                report->wingThrustMax = cfg.wingThrustMax;
+                report->weightWingThrust = cfg.weightWingThrust;
+            }
 
             const int pieceNum = T.size();
             const double integralFrac = 1.0 / integralResolution;
@@ -1554,13 +1780,21 @@ namespace gcopter
             double step, alpha, node, pena;
             double violaPos, violaVelSqr, violaTLo, violaTHi, violaOmg, violaGam;
             double violaTiltCos, violaTiltAngle;
+            double violaWingLeftLow, violaWingLeftHigh;
+            double violaWingRightLow, violaWingRightHigh;
+            double tLeft, tRight, gradThrWing, gradGammaWing;
+            bool wingUsable;
             double penaPos, penaVel, penaTLo, penaTHi, penaOmg, penaGam, penaTilt;
             // Per-term split of `pena`, so the report can say which constraint
             // the cost came from.
             double penaTermCorridor, penaTermVelocity, penaTermThrustLow;
             double penaTermThrustHigh, penaTermOmega, penaTermGamma;
             double penaTermTilt, penaTermDegenerate;
+            // The four per-side wing-thrust split terms.
+            double penaTermWingLeftLow, penaTermWingLeftHigh;
+            double penaTermWingRightLow, penaTermWingRightHigh;
             double dPos, dVel, dTLo, dTHi, dOmg, dGam, dTilt;
+            double dWingLeftLow, dWingLeftHigh, dWingRightLow, dWingRightHigh;
             double s1, s2, s3, s4, s5;
             Eigen::Matrix<double, 6, 1> beta0, beta1, beta2, beta3, beta4, beta5;
             int K, L;
@@ -1631,10 +1865,19 @@ namespace gcopter
                     penaTermGamma = 0.0;
                     penaTermTilt = 0.0;
                     penaTermDegenerate = 0.0;
+                    penaTermWingLeftLow = 0.0;
+                    penaTermWingLeftHigh = 0.0;
+                    penaTermWingRightLow = 0.0;
+                    penaTermWingRightHigh = 0.0;
                     violaTLo = 0.0;
                     violaTHi = 0.0;
                     violaOmg = 0.0;
                     violaGam = 0.0;
+                    violaWingLeftLow = 0.0;
+                    violaWingLeftHigh = 0.0;
+                    violaWingRightLow = 0.0;
+                    violaWingRightHigh = 0.0;
+                    wingUsable = false;
                     violaTiltAngle = 0.0;
 
                     // --- position corridor (unchanged from the quadrotor map) --
@@ -1681,6 +1924,80 @@ namespace gcopter
                         gradThr += cfg.weightThrust * dTHi;
                         pena += cfg.weightThrust * penaTHi;
                         penaTermThrustHigh += cfg.weightThrust * penaTHi;
+                    }
+
+                    // --- F_min <= T_L, T_R <= F_max --------------------------
+                    // The left/right split of the SAME forward() call's total
+                    // thrust and body roll moment:
+                    //     T_L = 0.5 (T - Gamma_x / l_eff)
+                    //     T_R = 0.5 (T + Gamma_x / l_eff)
+                    // and the four per-side violations. Gamma_x is gamma(0), so
+                    // this is a fourth-order constraint through the snap.
+                    //
+                    // Only a node with the whole attitude (fr.ok()) is split: a
+                    // node with no Gamma_x has no T_L/T_R to compare, gets no
+                    // fabricated values, and keeps the existing degenerate
+                    // charge. In that case dirUsable here would still be NaN
+                    // for gamma, so it could not be split anyway.
+                    if (fr.ok())
+                    {
+                        const double invArm = 1.0 / cfg.rollArm;
+                        const double halfArm = 0.5 * invArm;
+                        tLeft = 0.5 * (fr.thrust - fr.gamma(0) * invArm);
+                        tRight = 0.5 * (fr.thrust + fr.gamma(0) * invArm);
+                        wingUsable = true;
+
+                        violaWingLeftLow = cfg.wingThrustMin - tLeft;
+                        if (smoothedL1(violaWingLeftLow, smoothFactor,
+                                       penaTLo, dWingLeftLow))
+                        {
+                            gradThrWing = -0.5 * cfg.weightWingThrust * dWingLeftLow;
+                            gradGammaWing = halfArm * cfg.weightWingThrust * dWingLeftLow;
+                            pena += cfg.weightWingThrust * penaTLo;
+                            penaTermWingLeftLow += cfg.weightWingThrust * penaTLo;
+                        }
+                        else
+                        {
+                            gradThrWing = 0.0;
+                            gradGammaWing = 0.0;
+                        }
+                        violaWingLeftHigh = tLeft - cfg.wingThrustMax;
+                        if (smoothedL1(violaWingLeftHigh, smoothFactor,
+                                       penaTHi, dWingLeftHigh))
+                        {
+                            gradThrWing += 0.5 * cfg.weightWingThrust * dWingLeftHigh;
+                            gradGammaWing -= halfArm * cfg.weightWingThrust * dWingLeftHigh;
+                            pena += cfg.weightWingThrust * penaTHi;
+                            penaTermWingLeftHigh += cfg.weightWingThrust * penaTHi;
+                        }
+                        gradThr += gradThrWing;
+                        gradGamma(0) += gradGammaWing;
+
+                        violaWingRightLow = cfg.wingThrustMin - tRight;
+                        if (smoothedL1(violaWingRightLow, smoothFactor,
+                                       penaTLo, dWingRightLow))
+                        {
+                            gradThrWing = -0.5 * cfg.weightWingThrust * dWingRightLow;
+                            gradGammaWing = -halfArm * cfg.weightWingThrust * dWingRightLow;
+                            pena += cfg.weightWingThrust * penaTLo;
+                            penaTermWingRightLow += cfg.weightWingThrust * penaTLo;
+                        }
+                        else
+                        {
+                            gradThrWing = 0.0;
+                            gradGammaWing = 0.0;
+                        }
+                        violaWingRightHigh = tRight - cfg.wingThrustMax;
+                        if (smoothedL1(violaWingRightHigh, smoothFactor,
+                                       penaTHi, dWingRightHigh))
+                        {
+                            gradThrWing += 0.5 * cfg.weightWingThrust * dWingRightHigh;
+                            gradGammaWing += halfArm * cfg.weightWingThrust * dWingRightHigh;
+                            pena += cfg.weightWingThrust * penaTHi;
+                            penaTermWingRightHigh += cfg.weightWingThrust * penaTHi;
+                        }
+                        gradThr += gradThrWing;
+                        gradGamma(0) += gradGammaWing;
                     }
 
                     // --- per-axis |omega_i| <= omega_max_i, |Gamma_i| <= ... ---
@@ -1841,6 +2158,10 @@ namespace gcopter
                         report->penaltyGamma += weighted * penaTermGamma;
                         report->penaltyTilt += weighted * penaTermTilt;
                         report->penaltyDegenerate += weighted * penaTermDegenerate;
+                        report->penaltyWingLeftLow += weighted * penaTermWingLeftLow;
+                        report->penaltyWingLeftHigh += weighted * penaTermWingLeftHigh;
+                        report->penaltyWingRightLow += weighted * penaTermWingRightLow;
+                        report->penaltyWingRightHigh += weighted * penaTermWingRightHigh;
                         if (violaPos > report->violaCorridor)
                         {
                             report->violaCorridor = violaPos;
@@ -1904,9 +2225,76 @@ namespace gcopter
                             report->violaTilt = violaTiltAngle;
                         }
 
+                        // Left/right wing split observation. Only nodes the map
+                        // built an attitude for have a T_L/T_R; a degenerate
+                        // node contributes no fabricated reading.
+                        if (wingUsable)
+                        {
+                            const bool firstWing = report->wingNodes == 0;
+                            report->wingNodes++;
+                            if (firstWing || tLeft < report->minWingLeft)
+                            {
+                                report->minWingLeft = tLeft;
+                            }
+                            if (firstWing || tLeft > report->maxWingLeft)
+                            {
+                                report->maxWingLeft = tLeft;
+                            }
+                            if (firstWing || tRight < report->minWingRight)
+                            {
+                                report->minWingRight = tRight;
+                            }
+                            if (firstWing || tRight > report->maxWingRight)
+                            {
+                                report->maxWingRight = tRight;
+                            }
+                            if (violaWingLeftLow > report->violaWingLeftLow)
+                            {
+                                report->violaWingLeftLow = violaWingLeftLow;
+                            }
+                            if (violaWingLeftHigh > report->violaWingLeftHigh)
+                            {
+                                report->violaWingLeftHigh = violaWingLeftHigh;
+                            }
+                            if (violaWingRightLow > report->violaWingRightLow)
+                            {
+                                report->violaWingRightLow = violaWingRightLow;
+                            }
+                            if (violaWingRightHigh > report->violaWingRightHigh)
+                            {
+                                report->violaWingRightHigh = violaWingRightHigh;
+                            }
+                            // The allocation's own worst entry: the largest
+                            // relative exceedance over the four per-side bounds,
+                            // reported with the same ranking the aggregate uses.
+                            const double wingRelative[4] = {
+                                violaWingLeftLow * wingLowScale,
+                                violaWingLeftHigh * wingHighScale,
+                                violaWingRightLow * wingLowScale,
+                                violaWingRightHigh * wingHighScale};
+                            const FlappingViolation wingKinds[4] = {
+                                FlappingViolation::WingLeftLow,
+                                FlappingViolation::WingLeftHigh,
+                                FlappingViolation::WingRightLow,
+                                FlappingViolation::WingRightHigh};
+                            for (int k = 0; k < 4; k++)
+                            {
+                                if (wingRelative[k] > report->wingWorstRelative)
+                                {
+                                    report->wingWorstRelative = wingRelative[k];
+                                    report->worstWing = wingKinds[k];
+                                    report->violaWing =
+                                        (k == 0)   ? violaWingLeftLow
+                                        : (k == 1) ? violaWingLeftHigh
+                                        : (k == 2) ? violaWingRightLow
+                                                   : violaWingRightHigh;
+                                }
+                            }
+                        }
+
                         // Rank the violations by how far past their own bound
                         // they are, so different units can be compared.
-                        const double relative[8] = {
+                        const double relative[12] = {
                             violaPos,
                             violaVelSqr > 0.0 ? (speed - cfg.velMax) * velScale : 0.0,
                             violaTLo * thrustLowScale,
@@ -1914,8 +2302,12 @@ namespace gcopter
                             violaOmg * omegaScale,
                             violaGam * gammaScale,
                             violaTiltAngle * tiltScale,
-                            rateUsable ? 0.0 : 1.0};
-                        const FlappingViolation kinds[8] = {
+                            rateUsable ? 0.0 : 1.0,
+                            wingUsable ? violaWingLeftLow * wingLowScale : 0.0,
+                            wingUsable ? violaWingLeftHigh * wingHighScale : 0.0,
+                            wingUsable ? violaWingRightLow * wingLowScale : 0.0,
+                            wingUsable ? violaWingRightHigh * wingHighScale : 0.0};
+                        const FlappingViolation kinds[12] = {
                             FlappingViolation::Corridor,
                             FlappingViolation::Speed,
                             FlappingViolation::ThrustLow,
@@ -1923,8 +2315,12 @@ namespace gcopter
                             FlappingViolation::Omega,
                             FlappingViolation::Gamma,
                             FlappingViolation::Tilt,
-                            FlappingViolation::Degenerate};
-                        for (int k = 0; k < 8; k++)
+                            FlappingViolation::Degenerate,
+                            FlappingViolation::WingLeftLow,
+                            FlappingViolation::WingLeftHigh,
+                            FlappingViolation::WingRightLow,
+                            FlappingViolation::WingRightHigh};
+                        for (int k = 0; k < 12; k++)
                         {
                             if (relative[k] > report->maxViola)
                             {
@@ -2182,14 +2578,23 @@ namespace gcopter
         // above. setup() validates every length and value and throws
         // std::invalid_argument naming the offending entry, so a flapping
         // configuration can never be read with quadrotor indices.
+        //
+        // flappingAllocation and weightWingThrust are the left/right wing split
+        // (l_eff, F_min, F_max) and its scalar weight. They are explicit
+        // arguments with no default: the four per-side bounds are a separate
+        // constraint set from the 11/7/5 vectors, and a compiled-in default
+        // would let a caller silently inherit one vehicle's numbers.
         static inline bool validateConfig(const Eigen::VectorXd &flappingBounds,
                                           const Eigen::VectorXd &flappingWeights,
                                           const Eigen::VectorXd &flappingPhysical,
+                                          const Eigen::VectorXd &flappingAllocation,
+                                          const double weightWingThrust,
                                           std::string &reason)
         {
             FlappingConfig unused;
             return FlappingConfig::parse(flappingBounds, flappingWeights,
-                                         flappingPhysical, unused, reason);
+                                         flappingPhysical, flappingAllocation,
+                                         weightWingThrust, unused, reason);
         }
 
         inline bool setup(const double &timeWeight,
@@ -2201,12 +2606,15 @@ namespace gcopter
                           const int &integralResolution,
                           const Eigen::VectorXd &flappingBounds,
                           const Eigen::VectorXd &flappingWeights,
-                          const Eigen::VectorXd &flappingPhysical)
+                          const Eigen::VectorXd &flappingPhysical,
+                          const Eigen::VectorXd &flappingAllocation,
+                          const double &weightWingThrust)
         {
             std::string reason;
             FlappingConfig parsed;
             if (!FlappingConfig::parse(flappingBounds, flappingWeights,
-                                       flappingPhysical, parsed, reason))
+                                       flappingPhysical, flappingAllocation,
+                                       weightWingThrust, parsed, reason))
             {
                 throw std::invalid_argument("GCOPTER_PolytopeSFC_Flapping::setup: " +
                                             reason);
