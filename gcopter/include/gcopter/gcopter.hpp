@@ -43,6 +43,8 @@
 #include <iostream>
 #include <limits>
 #include <sstream>
+#include <functional>
+#include <utility>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -953,7 +955,8 @@ namespace gcopter
         WingLeftLow = 9,
         WingLeftHigh = 10,
         WingRightLow = 11,
-        WingRightHigh = 12
+        WingRightHigh = 12,
+        Additional = 13
     };
 
     inline const char *flappingViolationName(const FlappingViolation v)
@@ -986,6 +989,8 @@ namespace gcopter
             return "WingRightLow";
         case FlappingViolation::WingRightHigh:
             return "WingRightHigh";
+        case FlappingViolation::Additional:
+            return "Additional";
         }
         return "Unknown";
     }
@@ -1229,6 +1234,9 @@ namespace gcopter
     // the trajectory satisfies every enabled constraint.
     struct FlappingPenaltyReport
     {
+        // Optional research functional; zero when the existing path is used.
+        double additionalCost = 0.0;
+        double additionalMaxViola = 0.0;
         double cost = 0.0;      // cost the caller was charged: the penalty alone
                                 // from evaluatePenalty(), the whole objective from
                                 // evaluateObjective()
@@ -1412,6 +1420,9 @@ namespace gcopter
     class GCOPTER_PolytopeSFC_Flapping
     {
     public:
+        using AdditionalPenalty = std::function<double(
+            const Eigen::VectorXd &, const Eigen::MatrixX3d &,
+            Eigen::VectorXd &, Eigen::MatrixX3d &, double &)>;
         typedef Eigen::Matrix3Xd PolyhedronV;
         typedef Eigen::MatrixX4d PolyhedronH;
         typedef std::vector<PolyhedronV> PolyhedraV;
@@ -1448,6 +1459,8 @@ namespace gcopter
         double smoothEps;
         int integralRes;
         FlappingConfig flappingCfg;
+        AdditionalPenalty additionalPenalty;
+        Eigen::VectorXd lastOptimizedDecision;
         bool configured;
         double allocSpeed;
 
@@ -2574,6 +2587,56 @@ namespace gcopter
     public:
         GCOPTER_PolytopeSFC_Flapping() = default;
 
+        // Whole-trajectory callback, before MINCO's gradient propagation.
+        // gradT is at FIXED coefficients; gradC is at FIXED durations. This
+        // preserves MINCO's coefficient/time chain including phase history.
+        inline void setAdditionalPenalty(AdditionalPenalty callback)
+        {
+            additionalPenalty = std::move(callback);
+        }
+
+        inline void clearAdditionalPenalty() { additionalPenalty = nullptr; }
+        inline bool hasAdditionalPenalty() const { return bool(additionalPenalty); }
+        inline Eigen::VectorXd lastDecision() const
+        {
+            if (lastOptimizedDecision.size() == 0)
+                throw std::runtime_error("call optimize before lastDecision");
+            return lastOptimizedDecision;
+        }
+
+    private:
+        inline void attachAdditionalPenalty(
+            const Eigen::VectorXd &ts, const Eigen::MatrixX3d &cs,
+            double &cost, Eigen::VectorXd &gradT, Eigen::MatrixX3d &gradC,
+            FlappingPenaltyReport &report) const
+        {
+            if (!additionalPenalty) return;
+            Eigen::VectorXd dt;
+            Eigen::MatrixX3d dc;
+            double violation = 0.0;
+            const double value = additionalPenalty(ts, cs, dt, dc, violation);
+            if (!flapping::detail::isFinite(value) || value < 0.0 ||
+                !flapping::detail::isFinite(violation) || violation < 0.0 ||
+                dt.size() != ts.size() || dc.rows() != cs.rows() || dc.cols() != 3 ||
+                !flapping::detail::isFinite(dt) || !flapping::detail::isFinite(dc))
+                throw std::invalid_argument("additional penalty returned invalid cost/gradients/violation");
+            cost += value;
+            gradT += dt;
+            gradC += dc;
+            report.additionalCost = value;
+            report.additionalMaxViola = violation;
+            if (violation > report.maxViola)
+            {
+                report.maxViola = violation;
+                report.worst = FlappingViolation::Additional;
+                report.worstPiece = -1;
+                report.worstLocalTime = 0.0;
+            }
+            report.cost = cost;
+        }
+
+    public:
+
         // The flapping configuration vectors, in the index layouts declared
         // above. setup() validates every length and value and throws
         // std::invalid_argument naming the offending entry, so a flapping
@@ -2666,6 +2729,7 @@ namespace gcopter
             smoothEps = smoothingFactor;
             integralRes = integralResolution;
             flappingCfg = parsed;
+            lastOptimizedDecision.resize(0);
             flatmap.reset(parsed.mass, parsed.gravity, parsed.inertia);
             allocSpeed = parsed.velMax * 3.0;
 
@@ -2789,6 +2853,7 @@ namespace gcopter
             attachPenaltyFunctional(timesIn, coeffsIn, hPolyIdx, hPolytopes,
                                     smoothEps, integralRes, flappingCfg, flatmap,
                                     cost, gradT, gradC, &report);
+            attachAdditionalPenalty(timesIn, coeffsIn, cost, gradT, gradC, report);
         }
 
     private:
@@ -2908,6 +2973,9 @@ namespace gcopter
                                     cost, partialGradByTimes, partialGradByCoeffs,
                                     &report);
 
+            attachAdditionalPenalty(times, minco.getCoeffs(), cost,
+                                    partialGradByTimes, partialGradByCoeffs, report);
+
             minco.propogateGrad(partialGradByCoeffs, partialGradByTimes,
                                 gradByPoints, gradByTimes);
 
@@ -2955,6 +3023,8 @@ namespace gcopter
                                             nullptr,
                                             this,
                                             lbfgs_params);
+
+            lastOptimizedDecision = x;
 
             if (ret >= 0)
             {
